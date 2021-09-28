@@ -1,0 +1,106 @@
+---
+- hosts: ubuntu
+  gather_facts: yes
+  become: yes
+  vars_files:
+    - ./vault.yml
+
+  tasks:
+    - name: Lädt den Public Signing Key von Elastic herunter und installier ihn.
+      raw: "wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | sudo apt-key add -"
+
+    - name: Lädt das neuste apt-transport-https Paket über den apt-Package Manager herunter.
+      apt: name=apt-transport-https state=latest
+
+    - name: Speichert die Repository Definition von Elastic.
+      raw: echo "deb https://artifacts.elastic.co/packages/7.x/apt stable main" | sudo tee -a /etc/apt/sources.list.d/elastic-7.x.list
+
+    - name: Macht einen apt-get update.
+      apt: update_cache=yes
+
+    - name: Lädt Filebeat herunter und installiert ihn über den apt-Package Manager
+      apt:
+        name: filebeat
+        state: latest
+
+    - name: Aktiviere Filebeat beim starten des Systems.
+      systemd:
+        name: filebeat
+        enabled: yes
+
+    - name: startet den Filebeat Service.
+      systemd:
+        name: filebeat
+        state: started
+
+    - name: Kopiere die filebeat.yml auf den Ziel-Host unter /etc/filebeat/filebeat.yml
+      copy:
+        src: ./filebeat.yml
+        dest: /etc/filebeat/filebeat.yml
+
+    - name: Kopiere den INhalt von der Variable ca_pem in den Filebeat-Order und nenne die Datei ca.pem
+      copy:
+        content: "{{ ca_pem }}"
+        dest: '/etc/filebeat/ca.pem'
+
+    - name: Kopiere den Inhalt von der Variable ca_pem in den Truststore vom Zielhost und nne die Datei ca.pem
+      copy:
+        content: "{{ ca_pem }}"
+        dest: '/usr/local/share/ca-certificates/ca.pem'
+
+    - name: Aktualisiere den Trust-Store
+      raw: update-ca-certificates
+
+    - name: Mache einen Post-Request beim Elasticsearch-Cluster und frage einen API-Key an. Speichere die Antwort unter /etc/filebeat/output.json
+      uri:
+        url: https://192.168.0.3:9200/_security/api_key?pretty
+        user: api_key
+        password: "{{ api_user_secret }}"
+        method: POST
+        body: "{\"name\":\"{{ ansible_hostname }}-{{ ansible_default_ipv4.address }}\",\"role_descriptors\": { \"filebeat_writer\": { \"cluster\": [\"monitor\", \"read_ilm\",\"manage_ilm\",\"manage\",\"all\", \"read_pipeline\"], \"index\": [ { \"names\": [\"evoila-filebeat-*\"],\"privileges\": [\"view_index_metadata\", \"create_doc\",\"manage_ilm\",\"manage\",\"all\"]}]}}}"
+        body_format: json
+        headers:
+          Content-Type: application/json
+        validate_certs: no
+        force_basic_auth: yes
+        dest: /etc/filebeat/output.json
+
+    - name: Kopiere den json_parser.sh zum Zielhost
+      copy:
+        src: ./json_parser.sh
+        dest: /etc/filebeat/json_parser.sh
+
+    - name: Modifiziere die Rechte von json_parser.sh
+      raw: chmod 777 /etc/filebeat/json_parser.sh
+
+    - name: Führe den json_parser.sh aus
+      raw: /etc/filebeat/json_parser.sh
+
+    - name: Lese die api_key Datei aus und Registriere den Inhalt in die Variable api_key
+      raw: tail /etc/filebeat/api_key
+      register: api_key
+
+    - name: Registriere ob der /etc/systemd/system/filebeat.service.d Ordner existiert
+      stat:
+        path: /etc/systemd/system/filebeat.service.d
+      register: folderinfo
+
+    - name: Erstelle den /etc/systemd/system/filebeat.service.d Ordner wenn dieser NICHT Existiert.
+      raw: mkdir /etc/systemd/system/filebeat.service.d
+      when: not folderinfo.stat.exists
+
+    - name: Erstelle override.conf für den Filebeat Service und schreibe die Umgebungsvariable hinein.
+      copy:
+        dest: /etc/systemd/system/filebeat.service.d/override.conf
+        content: |
+          [Service]
+          Environment=ELK_API_KEY={{ api_key.stdout }}
+
+    - name: Lade den Systemctl Daemon neu.
+      systemd:
+        daemon_reload: yes
+
+    - name: Starte den Filebeat Service neu.
+      systemd:
+        name: filebeat
+        state: restarted
